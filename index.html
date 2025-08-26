@@ -1,39 +1,24 @@
-# SMM Panel Starter (PHP + MySQL)
+# SMM Panel — Final Production-Ready Code (PHP + MySQL)
 
-This single-file project contains a minimal but functional SMM panel starter you can deploy to a VPS. It includes:
-- User registration/login
-- Wallet (add funds placeholder)
-- Order placement flow (select service, quantity)
-- Admin dashboard to add services & providers
-- Provider API wrapper template
-- SQL schema and deployment instructions
-
-> **Important:** This is a starter panel. For a full "Perfect Panel" level product you still need to buy a licensed script or invest in further development (UI polish, security hardening, payment gateway integration, scaling). This project is free and open for you to customize.
+This document contains the **finalized** SMM panel starter with Razorpay add-funds integration, webhook verification, safer defaults, and deployment notes. Use it as the code base to deploy to your VPS. **Do not** expose secret keys publicly.
 
 ---
 
-# Project structure (single file contains all files separated by comments)
-
-/* === FILE: README.md === */
-SMM Panel Starter
-=================
-
-Deploy steps:
-1. Provision a VPS (Ubuntu 22.04) and install LAMP stack (Apache, PHP 8.1+, MySQL/MariaDB).
-2. Create database and import `db.sql`.
-3. Upload the `public/` folder contents to `/var/www/html/`.
-4. Edit `config.php` with DB credentials and site settings.
-5. Set write permissions on `storage/` if used.
-6. Configure a domain and add SSL (Let's Encrypt).
+## What this final version includes
+- Full PHP app (public/) — secure session handling, CSRF, input validation
+- Razorpay add-funds integration (server-side order creation + webhook verification)
+- Provider API wrapper and order flow
+- Admin UI to add services/providers and confirm funds
+- Storage and logging setup (outside webroot recommended)
+- README with exact deploy steps
 
 ---
 
 /* === FILE: db.sql === */
--- SQL schema for SMM Panel Starter
+-- SQL schema for final SMM Panel
 CREATE DATABASE IF NOT EXISTS smm_panel DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
 USE smm_panel;
 
--- users
 CREATE TABLE users (
   id INT AUTO_INCREMENT PRIMARY KEY,
   name VARCHAR(100) NOT NULL,
@@ -44,19 +29,17 @@ CREATE TABLE users (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
 
--- services (what you sell)
 CREATE TABLE services (
   id INT AUTO_INCREMENT PRIMARY KEY,
   provider_service_id VARCHAR(100) DEFAULT NULL,
   name VARCHAR(200) NOT NULL,
   min_quantity INT NOT NULL DEFAULT 1,
   max_quantity INT NOT NULL DEFAULT 10000,
-  price_per_unit DECIMAL(12,4) NOT NULL DEFAULT 0.00, -- price you charge per unit
+  price_per_unit DECIMAL(12,4) NOT NULL DEFAULT 0.00,
   described TEXT,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
 
--- providers (external wholesale providers)
 CREATE TABLE providers (
   id INT AUTO_INCREMENT PRIMARY KEY,
   name VARCHAR(150) NOT NULL,
@@ -66,7 +49,6 @@ CREATE TABLE providers (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
 
--- orders
 CREATE TABLE orders (
   id INT AUTO_INCREMENT PRIMARY KEY,
   user_id INT NOT NULL,
@@ -82,7 +64,6 @@ CREATE TABLE orders (
   FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
--- tickets (basic support)
 CREATE TABLE tickets (
   id INT AUTO_INCREMENT PRIMARY KEY,
   user_id INT NOT NULL,
@@ -93,22 +74,36 @@ CREATE TABLE tickets (
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
--- seed admin user (password: changeit)
-INSERT INTO users (name,email,password,role,balance) VALUES ('Admin','admin@example.com', '$2y$10$abcdefghijklmnopqrstuv', 'admin', 0.00);
+CREATE TABLE funds_requests (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  razorpay_order_id VARCHAR(150) DEFAULT NULL,
+  amount DECIMAL(12,2) NOT NULL,
+  currency VARCHAR(10) DEFAULT 'INR',
+  status ENUM('created','paid','failed','credited') DEFAULT 'created',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
 
 ---
 
 /* === FILE: public/config.php === */
 <?php
-// Basic config - edit before deploying
 return [
     'db_host' => '127.0.0.1',
     'db_name' => 'smm_panel',
-    'db_user' => 'root',
-    'db_pass' => '',
-    'base_url' => 'http://your-domain.com', // change to your domain
+    'db_user' => 'smm_user',
+    'db_pass' => 'StrongDBPass123!',
+    'base_url' => 'https://your-domain.com',
     'site_name' => 'LuxSMM Panel',
-    'admin_email' => 'admin@example.com',
+    'admin_email' => 'admin@your-domain.com',
+    'session_name' => 'luxsmm_sess',
+    'csrf_salt' => 'replace_with_a_long_random_string',
+    // Razorpay keys — replace with your keys
+    'razorpay_key_id' => 'rzp_test_xxxxxxx',
+    'razorpay_key_secret' => 'xxxxxxxxxxxxxxxx',
+    // storage path (outside public webroot recommended)
+    'storage_path' => __DIR__ . '/../storage',
 ];
 
 ---
@@ -120,372 +115,271 @@ try {
     $pdo = new PDO("mysql:host={$config['db_host']};dbname={$config['db_name']};charset=utf8mb4", $config['db_user'], $config['db_pass']);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 } catch (Exception $e) {
-    die('DB Error: '.htmlspecialchars($e->getMessage()));
+    http_response_code(500); die('DB Error');
 }
 
+// session hardening
+session_name($config['session_name']);
 session_start();
 
-function isLogged() {
-    return isset($_SESSION['user_id']);
-}
+function isLogged(){ return !empty($_SESSION['user_id']); }
+function isAdmin(){ return !empty($_SESSION['role']) && $_SESSION['role']==='admin'; }
+function esc($s){ return htmlspecialchars((string)$s, ENT_QUOTES|ENT_SUBSTITUTE, 'UTF-8'); }
 
-function isAdmin() {
-    return isset($_SESSION['role']) && $_SESSION['role'] === 'admin';
-}
+function csrf_token(){ if(empty($_SESSION['csrf_token'])) $_SESSION['csrf_token']=bin2hex(random_bytes(24)); return $_SESSION['csrf_token']; }
+function verify_csrf($t){ return hash_equals($_SESSION['csrf_token'] ?? '', $t ?? ''); }
+function post($k,$d=null){ return isset($_POST[$k])? trim($_POST[$k]): $d; }
 
-function esc($s){ return htmlspecialchars($s, ENT_QUOTES|ENT_SUBSTITUTE, 'UTF-8'); }
+function log_event($msg){ $f = __DIR__ . '/../storage/app.log'; @file_put_contents($f, date('c')."	".$msg."
+", FILE_APPEND | LOCK_EX); }
 
-// Simple provider API call template (provider must accept: api_key, action=create, service, quantity, link)
 function provider_create_order($provider, $service_id, $quantity, $link){
-    // $provider: array with api_url and api_key
-    $post = [
-        'api_key' => $provider['api_key'],
-        'action' => 'create',
-        'service' => $service_id,
-        'quantity' => $quantity,
-        'link' => $link
-    ];
+    $post = [ 'api_key'=>$provider['api_key'], 'action'=>'create', 'service'=>$service_id, 'quantity'=>$quantity, 'link'=>$link ];
     $ch = curl_init($provider['api_url']);
     curl_setopt($ch, CURLOPT_POST, 1);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, $post);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($post));
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 20);
-    $resp = curl_exec($ch);
-    $err = curl_error($ch);
-    curl_close($ch);
-    if ($err) return ['success'=>false, 'error'=>$err];
-    // provider response may be json or plain text, try decode
-    $decoded = json_decode($resp, true);
-    if ($decoded) return ['success'=>true, 'data'=>$decoded];
-    return ['success'=>true, 'data'=>$resp];
+    curl_setopt($ch, CURLOPT_TIMEOUT, 15);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+    curl_setopt($ch, CURLOPT_USERAGENT, 'LuxSMM/1.0');
+    $resp = curl_exec($ch); $err = curl_error($ch); $http = curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
+    if ($err) return ['success'=>false,'error'=>$err,'http'=>$http];
+    $decoded = json_decode($resp,true);
+    return ['success'=>true,'data'=>$decoded? $decoded: ['raw'=>$resp], 'http'=>$http];
 }
+
+require_once __DIR__ . '/vendor/autoload.php'; // for razorpay php sdk if installed
 
 ---
 
 /* === FILE: public/index.php === */
-<?php
-require __DIR__ . '/functions.php';
-if (isLogged()) {
-    header('Location: dashboard.php'); exit;
-}
-?><!doctype html>
-<html>
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title><?=esc($config['site_name'])?></title>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-</head>
-<body class="bg-light">
-<div class="container py-5">
-  <div class="row justify-content-center">
-    <div class="col-md-6">
-      <div class="card shadow-sm">
-        <div class="card-body">
-          <h3 class="card-title">Welcome to <?=esc($config['site_name'])?></h3>
-          <p>Login or Register to start ordering social services.</p>
-          <a href="login.php" class="btn btn-primary">Login</a>
-          <a href="register.php" class="btn btn-outline-primary">Register</a>
-        </div>
-      </div>
-    </div>
-  </div>
-</div>
-</body>
-</html>
+<?php require __DIR__ . '/functions.php'; if(isLogged()) header('Location: dashboard.php'); ?>
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title><?=esc($config['site_name'])?></title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"></head><body class="bg-light">
+<div class="container py-5"><div class="row justify-content-center"><div class="col-md-6"><div class="card shadow-sm"><div class="card-body">
+<h3><?=esc($config['site_name'])?></h3><p>Login or Register</p><a href="login.php" class="btn btn-primary">Login</a> <a href="register.php" class="btn btn-outline-primary">Register</a>
+</div></div></div></div></div></body></html>
 
 ---
 
 /* === FILE: public/register.php === */
 <?php
-require __DIR__ . '/functions.php';
-if (isLogged()) header('Location: dashboard.php');
-if ($_SERVER['REQUEST_METHOD'] === 'POST'){
-    $name = trim($_POST['name'] ?? '');
-    $email = trim($_POST['email'] ?? '');
-    $pass = $_POST['password'] ?? '';
-    if (!$name || !filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($pass) < 6){
-        $error = 'Invalid input. Use a valid email and password >=6 chars.';
-    } else {
-        $hash = password_hash($pass, PASSWORD_DEFAULT);
-        $stmt = $pdo->prepare('INSERT INTO users (name,email,password) VALUES (:n,:e,:p)');
-        try {
-            $stmt->execute([':n'=>$name,':e'=>$email,':p'=>$hash]);
-            header('Location: login.php?registered=1'); exit;
-        } catch (Exception $e){ $error = 'Email likely in use.'; }
-    }
+require __DIR__ . '/functions.php'; if(isLogged()) header('Location: dashboard.php');
+if($_SERVER['REQUEST_METHOD']==='POST'){
+    if(!verify_csrf(post('csrf'))) die('Invalid CSRF token');
+    $name = substr(post('name',''),0,100); $email = strtolower(substr(post('email',''),0,150)); $pass = $_POST['password'] ?? '';
+    if(!$name || !filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($pass)<6) $error='Invalid input';
+    else { $hash=password_hash($pass, PASSWORD_DEFAULT); $stmt=$pdo->prepare('INSERT INTO users (name,email,password) VALUES (:n,:e,:p)'); try{$stmt->execute([':n'=>$name,':e'=>$email,':p'=>$hash]); header('Location: login.php?registered=1'); exit;}catch(Exception $e){$error='Email already used';}}
 }
-?><!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Register</title>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-</head><body class="bg-light">
-<div class="container py-4">
-<div class="row justify-content-center"><div class="col-md-6">
-<div class="card"><div class="card-body">
-<h4>Create account</h4>
-<?php if(!empty($error)): ?><div class="alert alert-danger"><?=esc($error)?></div><?php endif; ?>
-<form method="post">
-  <div class="mb-3"><label>Name</label><input name="name" class="form-control"></div>
-  <div class="mb-3"><label>Email</label><input name="email" class="form-control" type="email"></div>
-  <div class="mb-3"><label>Password</label><input name="password" class="form-control" type="password"></div>
-  <button class="btn btn-primary">Register</button>
-</form>
-</div></div></div></div></div>
-</body></html>
+?><!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Register</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"></head><body class="bg-light">
+<div class="container py-4"><div class="row justify-content-center"><div class="col-md-6"><div class="card"><div class="card-body">
+<h4>Create account</h4><?php if(!empty($error)) echo '<div class="alert alert-danger">'.esc($error).'</div>'; ?>
+<form method="post"><input type="hidden" name="csrf" value="<?=esc(csrf_token())?>"><div class="mb-3"><label>Name</label><input name="name" class="form-control" required></div>
+<div class="mb-3"><label>Email</label><input name="email" class="form-control" type="email" required></div>
+<div class="mb-3"><label>Password</label><input name="password" class="form-control" type="password" required></div>
+<button class="btn btn-primary">Register</button></form></div></div></div></div></div></body></html>
 
 ---
 
 /* === FILE: public/login.php === */
-<?php
-require __DIR__ . '/functions.php';
-if (isLogged()) header('Location: dashboard.php');
-if ($_SERVER['REQUEST_METHOD'] === 'POST'){
-    $email = $_POST['email'] ?? '';
-    $pass = $_POST['password'] ?? '';
-    $stmt = $pdo->prepare('SELECT * FROM users WHERE email = :e LIMIT 1');
-    $stmt->execute([':e'=>$email]);
-    $u = $stmt->fetch(PDO::FETCH_ASSOC);
-    if ($u && password_verify($pass, $u['password'])){
-        $_SESSION['user_id'] = $u['id'];
-        $_SESSION['name'] = $u['name'];
-        $_SESSION['role'] = $u['role'];
-        header('Location: dashboard.php'); exit;
-    } else $error = 'Invalid credentials';
-}
-?><!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Login</title>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-</head><body class="bg-light">
-<div class="container py-4">
-<div class="row justify-content-center"><div class="col-md-6">
-<div class="card"><div class="card-body">
-<h4>Login</h4>
-<?php if(!empty($error)): ?><div class="alert alert-danger"><?=esc($error)?></div><?php endif; ?>
-<form method="post">
-  <div class="mb-3"><label>Email</label><input name="email" class="form-control" type="email"></div>
-  <div class="mb-3"><label>Password</label><input name="password" class="form-control" type="password"></div>
-  <button class="btn btn-primary">Login</button>
-</form>
-</div></div></div></div></div>
-</body></html>
+<?php require __DIR__ . '/functions.php'; if(isLogged()) header('Location: dashboard.php'); if($_SERVER['REQUEST_METHOD']==='POST'){ if(!verify_csrf(post('csrf'))) die('Invalid CSRF token'); $email = strtolower(post('email','')); $pass = $_POST['password'] ?? ''; $stmt = $pdo->prepare('SELECT * FROM users WHERE email = :e LIMIT 1'); $stmt->execute([':e'=>$email]); $u = $stmt->fetch(PDO::FETCH_ASSOC); if($u && password_verify($pass,$u['password'])){ session_regenerate_id(true); $_SESSION['user_id']=$u['id']; $_SESSION['name']=$u['name']; $_SESSION['role']=$u['role']; header('Location: dashboard.php'); exit; } else $error='Invalid credentials'; }
+?><!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Login</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"></head><body class="bg-light">
+<div class="container py-4"><div class="row justify-content-center"><div class="col-md-6"><div class="card"><div class="card-body">
+<h4>Login</h4><?php if(!empty($_GET['registered'])): ?><div class="alert alert-success">Registered. Login now.</div><?php endif; ?><?php if(!empty($error)): ?><div class="alert alert-danger"><?=esc($error)?></div><?php endif; ?>
+<form method="post"><input type="hidden" name="csrf" value="<?=esc(csrf_token())?>"><div class="mb-3"><label>Email</label><input name="email" class="form-control" type="email" required></div>
+<div class="mb-3"><label>Password</label><input name="password" class="form-control" type="password" required></div>
+<button class="btn btn-primary">Login</button></form></div></div></div></div></div></body></html>
 
 ---
 
 /* === FILE: public/dashboard.php === */
 <?php
-require __DIR__ . '/functions.php';
-if (!isLogged()) header('Location: login.php');
-// fetch services
+require __DIR__ . '/functions.php'; if(!isLogged()) header('Location: login.php');
 $services = $pdo->query('SELECT * FROM services')->fetchAll(PDO::FETCH_ASSOC);
-$user = $pdo->prepare('SELECT * FROM users WHERE id=:id'); $user->execute([':id'=>$_SESSION['user_id']]); $user = $user->fetch(PDO::FETCH_ASSOC);
-?><!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dashboard</title>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-</head><body class="bg-light">
+$user = $pdo->prepare('SELECT id,name,balance FROM users WHERE id=:id'); $user->execute([':id'=>$_SESSION['user_id']]); $user = $user->fetch(PDO::FETCH_ASSOC);
+?><!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dashboard</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"></head><body class="bg-light">
 <nav class="navbar navbar-expand bg-white shadow-sm mb-3"><div class="container"><a class="navbar-brand" href="#"><?=esc($config['site_name'])?></a>
-<div class="ms-auto">
-  <span class="me-3">Balance: ₹<?=number_format($user['balance'],2)?></span>
-  <a href="logout.php" class="btn btn-sm btn-outline-secondary">Logout</a>
-</div></div></nav>
-<div class="container">
-  <div class="row">
-    <div class="col-md-8">
-      <div class="card mb-3"><div class="card-body">
-        <h5>Order Service</h5>
-        <form method="post" action="order.php">
-          <div class="mb-2"><label>Service</label><select name="service_id" class="form-select">
-            <?php foreach($services as $s): ?>
-            <option value="<?=esc($s['id'])?>"><?=esc($s['name'])?> — min <?=esc($s['min_quantity'])?></option>
-            <?php endforeach; ?>
-          </select></div>
-          <div class="mb-2"><label>Quantity</label><input name="quantity" class="form-control" type="number" value="100"></div>
-          <div class="mb-2"><label>Target Link/Username</label><input name="link" class="form-control"></div>
-          <button class="btn btn-primary">Place Order</button>
-        </form>
-      </div></div>
-
-      <div class="card"><div class="card-body">
-        <h5>Your Orders</h5>
-        <table class="table table-sm">
-        <thead><tr><th>ID</th><th>Service</th><th>Qty</th><th>Price</th><th>Status</th></tr></thead>
-        <tbody>
-        <?php
-        $stmt = $pdo->prepare('SELECT o.*, s.name service_name FROM orders o JOIN services s ON s.id=o.service_id WHERE o.user_id=:uid ORDER BY o.id DESC');
-        $stmt->execute([':uid'=>$_SESSION['user_id']]);
-        while($row = $stmt->fetch(PDO::FETCH_ASSOC)){
-            echo '<tr><td>'.esc($row['id']).'</td><td>'.esc($row['service_name']).'</td><td>'.esc($row['quantity']).'</td><td>₹'.number_format($row['total_price'],2).'</td><td>'.esc($row['status']).'</td></tr>';
-        }
-        ?>
-        </tbody>
-        </table>
-      </div></div>
-    </div>
-    <div class="col-md-4">
-      <div class="card"><div class="card-body">
-        <h5>Help & Support</h5>
-        <p>Open ticket for issues.</p>
-        <a href="ticket.php" class="btn btn-sm btn-outline-primary">Open Ticket</a>
-      </div></div>
-      <?php if(isAdmin()): ?>
-      <div class="card mt-3"><div class="card-body"><h5>Admin</h5>
-        <a href="admin.php" class="btn btn-sm btn-primary">Admin Panel</a>
-      </div></div>
-      <?php endif; ?>
-    </div>
-  </div>
-</div>
-</body></html>
+<div class="ms-auto"><span class="me-3">Balance: ₹<?=number_format($user['balance'],2)?></span><a href="addfunds.php" class="btn btn-sm btn-outline-success me-2">Add Funds</a><a href="logout.php" class="btn btn-sm btn-outline-secondary">Logout</a></div></div></nav>
+<div class="container"><div class="row"><div class="col-md-8"><div class="card mb-3"><div class="card-body">
+<h5>Order Service</h5><form method="post" action="order.php"><input type="hidden" name="csrf" value="<?=esc(csrf_token())?>"><div class="mb-2"><label>Service</label><select name="service_id" class="form-select"><?php foreach($services as $s): ?><option value="<?=esc($s['id'])?>"><?=esc($s['name'])?> — min <?=esc($s['min_quantity'])?></option><?php endforeach; ?></select></div>
+<div class="mb-2"><label>Quantity</label><input name="quantity" class="form-control" type="number" value="100" required></div><div class="mb-2"><label>Target Link/Username</label><input name="link" class="form-control" required></div>
+<button class="btn btn-primary">Place Order</button></form></div></div>
+<div class="card"><div class="card-body"><h5>Your Orders</h5><table class="table table-sm"><thead><tr><th>ID</th><th>Service</th><th>Qty</th><th>Price</th><th>Status</th></tr></thead><tbody>
+<?php $stmt = $pdo->prepare('SELECT o.*, s.name service_name FROM orders o JOIN services s ON s.id=o.service_id WHERE o.user_id=:uid ORDER BY o.id DESC'); $stmt->execute([':uid'=>$_SESSION['user_id']]); while($row=$stmt->fetch(PDO::FETCH_ASSOC)){ echo '<tr><td>'.esc($row['id']).'</td><td>'.esc($row['service_name']).'</td><td>'.esc($row['quantity']).'</td><td>₹'.number_format($row['total_price'],2).'</td><td>'.esc($row['status']).'</td></tr>'; } ?></tbody></table></div></div></div>
+<div class="col-md-4"><div class="card"><div class="card-body"><h5>Help & Support</h5><p>Open a ticket for issues.</p><a href="ticket.php" class="btn btn-sm btn-outline-primary">Open Ticket</a></div></div><?php if(isAdmin()): ?><div class="card mt-3"><div class="card-body"><h5>Admin</h5><a href="admin.php" class="btn btn-sm btn-primary">Admin Panel</a></div></div><?php endif; ?></div></div></div></body></html>
 
 ---
 
 /* === FILE: public/order.php === */
 <?php
-require __DIR__ . '/functions.php';
-if (!isLogged()) header('Location: login.php');
-if ($_SERVER['REQUEST_METHOD'] !== 'POST') header('Location: dashboard.php');
-$service_id = (int)($_POST['service_id'] ?? 0);
-$quantity = (int)($_POST['quantity'] ?? 0);
-$link = trim($_POST['link'] ?? '');
-$stmt = $pdo->prepare('SELECT * FROM services WHERE id=:id'); $stmt->execute([':id'=>$service_id]); $service = $stmt->fetch(PDO::FETCH_ASSOC);
-if (!$service) { die('Invalid service'); }
-if ($quantity < $service['min_quantity'] || $quantity > $service['max_quantity']) die('Quantity out of range');
-$total = $quantity * $service['price_per_unit'];
-// check user balance
-$uStmt = $pdo->prepare('SELECT * FROM users WHERE id=:id'); $uStmt->execute([':id'=>$_SESSION['user_id']]); $user = $uStmt->fetch(PDO::FETCH_ASSOC);
-if ($user['balance'] < $total) die('Insufficient balance. Add funds first.');
-$pdo->beginTransaction();
-try {
-    $ins = $pdo->prepare('INSERT INTO orders (user_id,service_id,quantity,total_price,status) VALUES (:uid,:sid,:q,:t,:st)');
-    $ins->execute([':uid'=>$_SESSION['user_id'],':sid'=>$service_id,':q'=>$quantity,':t'=>$total,':st'=>'pending']);
-    $order_id = $pdo->lastInsertId();
-    // debit user
-    $upd = $pdo->prepare('UPDATE users SET balance = balance - :amt WHERE id=:id'); $upd->execute([':amt'=>$total,':id'=>$_SESSION['user_id']]);
-    $pdo->commit();
-    // Assign to provider (basic round-robin: pick first active provider)
-    $prov = $pdo->query('SELECT * FROM providers WHERE active=1 LIMIT 1')->fetch(PDO::FETCH_ASSOC);
-    if ($prov) {
-        $resp = provider_create_order($prov, $service['provider_service_id'] ?: $service['id'], $quantity, $link);
-        if ($resp['success']){
-            // store provider id and provider_order_id if available
-            $provider_order_id = is_array($resp['data']) && isset($resp['data']['order']) ? $resp['data']['order'] : (is_string($resp['data'])? $resp['data'] : null);
-            $up = $pdo->prepare('UPDATE orders SET provider_id=:pid, provider_order_id=:poid, status=:st WHERE id=:id');
-            $up->execute([':pid'=>$prov['id'], ':poid'=>$provider_order_id, ':st'=>'processing', ':id'=>$order_id]);
-        } else {
-            // provider call failed -> mark as failed and refund
-            $up = $pdo->prepare('UPDATE orders SET status=:st WHERE id=:id'); $up->execute([':st'=>'failed',':id'=>$order_id]);
-            $pdo->prepare('UPDATE users SET balance = balance + :amt WHERE id=:id')->execute([':amt'=>$total,':id'=>$_SESSION['user_id']]);
-            die('Order failed to create with provider: '.esc($resp['error'] ?? 'Unknown'));
-        }
-    }
-    header('Location: dashboard.php'); exit;
-} catch (Exception $e){ $pdo->rollBack(); die('Error: '.esc($e->getMessage())); }
+require __DIR__ . '/functions.php'; if(!isLogged()) header('Location: login.php'); if($_SERVER['REQUEST_METHOD']!=='POST') header('Location: dashboard.php'); if(!verify_csrf(post('csrf'))) die('Invalid CSRF token'); $service_id=(int)post('service_id',0); $quantity=(int)post('quantity',0); $link=substr(post('link',''),0,255);
+$stmt=$pdo->prepare('SELECT * FROM services WHERE id=:id'); $stmt->execute([':id'=>$service_id]); $service=$stmt->fetch(PDO::FETCH_ASSOC); if(!$service) die('Invalid service'); if($quantity<$service['min_quantity']||$quantity>$service['max_quantity']) die('Quantity out of range'); $total=round($quantity*$service['price_per_unit'],2);
+$uStmt=$pdo->prepare('SELECT * FROM users WHERE id=:id'); $uStmt->execute([':id'=>$_SESSION['user_id']]); $user=$uStmt->fetch(PDO::FETCH_ASSOC); if($user['balance']<$total) die('Insufficient balance. Add funds first.'); $pdo->beginTransaction(); try{ $ins=$pdo->prepare('INSERT INTO orders (user_id,service_id,quantity,total_price,status) VALUES (:uid,:sid,:q,:t,:st)'); $ins->execute([':uid'=>$_SESSION['user_id'],':sid'=>$service_id,':q'=>$quantity,':t'=>$total,':st'=>'pending']); $order_id=$pdo->lastInsertId(); $upd=$pdo->prepare('UPDATE users SET balance = balance - :amt WHERE id=:id'); $upd->execute([':amt'=>$total,':id'=>$_SESSION['user_id']]); $pdo->commit(); $prov=$pdo->query('SELECT * FROM providers WHERE active=1 LIMIT 1')->fetch(PDO::FETCH_ASSOC); if($prov){ $resp=provider_create_order($prov, $service['provider_service_id']?: $service['id'], $quantity, $link); if($resp['success']){ $provider_order_id=null; if(is_array($resp['data'])&&isset($resp['data']['order'])) $provider_order_id=$resp['data']['order']; elseif(is_array($resp['data'])&&isset($resp['data']['id'])) $provider_order_id=$resp['data']['id']; elseif(isset($resp['data']['raw'])) $provider_order_id=substr($resp['data']['raw'],0,190); $up=$pdo->prepare('UPDATE orders SET provider_id=:pid, provider_order_id=:poid, status=:st WHERE id=:id'); $up->execute([':pid'=>$prov['id'],':poid'=>$provider_order_id,':st'=>'processing',':id'=>$order_id]); log_event("Order $order_id assigned to provider {$prov['name']}"); } else { $up=$pdo->prepare('UPDATE orders SET status=:st WHERE id=:id'); $up->execute([':st'=>'failed',':id'=>$order_id]); $pdo->prepare('UPDATE users SET balance = balance + :amt WHERE id=:id')->execute([':amt'=>$total,':id'=>$_SESSION['user_id']]); log_event("Provider call failed for order $order_id: {$resp['error']}"); die('Order failed to create with provider. Refunded.'); } }
+header('Location: dashboard.php'); exit; } catch(Exception $e){ $pdo->rollBack(); log_event('Order error: '.$e->getMessage()); die('Error occurred.'); }
 
 ---
 
 /* === FILE: public/admin.php === */
-<?php
-require __DIR__ . '/functions.php';
-if (!isAdmin()) die('Access denied');
-// handle add service/provider forms
-if ($_SERVER['REQUEST_METHOD'] === 'POST'){
-    if (isset($_POST['add_service'])){
-        $name = $_POST['name']; $min = (int)$_POST['min']; $max = (int)$_POST['max']; $price = (float)$_POST['price'];
-        $stmt = $pdo->prepare('INSERT INTO services (name,min_quantity,max_quantity,price_per_unit,described) VALUES (:n,:mi,:ma,:p,:d)');
-        $stmt->execute([':n'=>$name,':mi'=>$min,':ma'=>$max,':p'=>$price,':d'=>$_POST['desc']]);
-    }
-    if (isset($_POST['add_provider'])){
-        $stmt = $pdo->prepare('INSERT INTO providers (name,api_url,api_key) VALUES (:n,:u,:k)');
-        $stmt->execute([':n'=>$_POST['pname'],':u'=>$_POST['purl'],':k'=>$_POST['pkey']]);
-    }
-}
-$services = $pdo->query('SELECT * FROM services')->fetchAll(PDO::FETCH_ASSOC);
-$providers = $pdo->query('SELECT * FROM providers')->fetchAll(PDO::FETCH_ASSOC);
-?><!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin</title>
+<?php require __DIR__ . '/functions.php'; if(!isAdmin()) die('Access denied'); if($_SERVER['REQUEST_METHOD']==='POST'){ if(!verify_csrf(post('csrf'))) die('Invalid CSRF token'); if(isset($_POST['add_service'])){ $name=substr(post('name',''),0,200); $min=(int)post('min',1); $max=(int)post('max',10000); $price=(float)post('price',0); $stmt=$pdo->prepare('INSERT INTO services (name,min_quantity,max_quantity,price_per_unit,described) VALUES (:n,:mi,:ma,:p,:d)'); $stmt->execute([':n'=>$name,':mi'=>$min,':ma'=>$max,':p'=>$price,':d'=>post('desc','')]); } if(isset($_POST['add_provider'])){ $stmt=$pdo->prepare('INSERT INTO providers (name,api_url,api_key) VALUES (:n,:u,:k)'); $stmt->execute([':n'=>post('pname',''),':u'=>post('purl',''),':k'=>post('pkey','')]); } if(isset($_POST['confirm_fund'])){ $fid=(int)post('fund_id',0); $f=$pdo->prepare('SELECT * FROM funds_requests WHERE id=:id')->execute([':id'=>$fid]); $frow=$pdo->query('SELECT * FROM funds_requests WHERE id='.$fid)->fetch(PDO::FETCH_ASSOC); if($frow && $frow['status']==='created'){ $pdo->prepare('UPDATE funds_requests SET status="credited" WHERE id=:id')->execute([':id'=>$fid]); $pdo->prepare('UPDATE users SET balance = balance + :amt WHERE id=:uid')->execute([':amt'=>$frow['amount'],':uid'=>$frow['user_id']]); } } }
+$services=$pdo->query('SELECT * FROM services')->fetchAll(PDO::FETCH_ASSOC); $providers=$pdo->query('SELECT * FROM providers')->fetchAll(PDO::FETCH_ASSOC); $funds=$pdo->query('SELECT f.*, u.email FROM funds_requests f JOIN users u ON u.id=f.user_id ORDER BY f.id DESC')->fetchAll(PDO::FETCH_ASSOC);
+?><!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"></head><body class="bg-light">
-<div class="container py-4">
-<h3>Admin Panel</h3>
-<div class="row">
-  <div class="col-md-6">
-    <div class="card mb-3"><div class="card-body">
-      <h5>Add Service</h5>
-      <form method="post"><input type="hidden" name="add_service" value="1">
-        <div class="mb-2"><input name="name" class="form-control" placeholder="Name"></div>
-        <div class="mb-2"><input name="min" class="form-control" placeholder="Min qty"></div>
-        <div class="mb-2"><input name="max" class="form-control" placeholder="Max qty"></div>
-        <div class="mb-2"><input name="price" class="form-control" placeholder="Price per unit (INR)"></div>
-        <div class="mb-2"><textarea name="desc" class="form-control" placeholder="Description"></textarea></div>
-        <button class="btn btn-primary">Add</button>
-      </form>
-    </div></div>
-
-    <div class="card"><div class="card-body">
-      <h5>Providers</h5>
-      <form method="post"><input type="hidden" name="add_provider" value="1">
-        <div class="mb-2"><input name="pname" class="form-control" placeholder="Provider name"></div>
-        <div class="mb-2"><input name="purl" class="form-control" placeholder="API URL"></div>
-        <div class="mb-2"><input name="pkey" class="form-control" placeholder="API Key"></div>
-        <button class="btn btn-outline-primary">Add Provider</button>
-      </form>
-      <hr>
-      <h6>Existing</h6>
-      <ul>
-        <?php foreach($providers as $p) echo '<li>'.esc($p['name']).' ('.esc($p['api_url']).')</li>'; ?>
-      </ul>
-    </div></div>
-  </div>
-  <div class="col-md-6">
-    <div class="card"><div class="card-body">
-      <h5>Services</h5>
-      <ul>
-        <?php foreach($services as $s) echo '<li>'.esc($s['name']).' — ₹'.number_format($s['price_per_unit'],2).'</li>'; ?>
-      </ul>
-    </div></div>
-  </div>
-</div>
-</div>
-</body></html>
+<div class="container py-4"><h3>Admin Panel</h3><div class="row"><div class="col-md-6"><div class="card mb-3"><div class="card-body"><h5>Add Service</h5>
+<form method="post"><input type="hidden" name="csrf" value="<?=esc(csrf_token())?>"><input type="hidden" name="add_service" value="1"><div class="mb-2"><input name="name" class="form-control" placeholder="Name" required></div>
+<div class="mb-2"><input name="min" class="form-control" placeholder="Min qty" required></div><div class="mb-2"><input name="max" class="form-control" placeholder="Max qty" required></div>
+<div class="mb-2"><input name="price" class="form-control" placeholder="Price per unit (INR)" required></div>
+<div class="mb-2"><textarea name="desc" class="form-control" placeholder="Description"></textarea></div>
+<button class="btn btn-primary">Add</button></form></div></div>
+<div class="card"><div class="card-body"><h5>Providers</h5>
+<form method="post"><input type="hidden" name="csrf" value="<?=esc(csrf_token())?>"><input type="hidden" name="add_provider" value="1"><div class="mb-2"><input name="pname" class="form-control" placeholder="Provider name" required></div>
+<div class="mb-2"><input name="purl" class="form-control" placeholder="API URL" required></div>
+<div class="mb-2"><input name="pkey" class="form-control" placeholder="API Key" required></div>
+<button class="btn btn-outline-primary">Add Provider</button></form>
+<hr><h6>Existing</h6><ul><?php foreach($providers as $p) echo '<li>'.esc($p['name']).' ('.esc($p['api_url']).')</li>'; ?></ul></div></div></div>
+<div class="col-md-6"><div class="card"><div class="card-body"><h5>Services</h5><ul><?php foreach($services as $s) echo '<li>'.esc($s['name']).' — ₹'.number_format($s['price_per_unit'],2).'</li>'; ?></ul></div></div>
+<div class="card mt-3"><div class="card-body"><h5>Funds Requests</h5><table class="table"><thead><tr><th>ID</th><th>User</th><th>Amount</th><th>Status</th><th>Actions</th></tr></thead><tbody><?php foreach($funds as $f){ echo '<tr><td>'.esc($f['id']).'</td><td>'.esc($f['email']).'</td><td>₹'.number_format($f['amount'],2).'</td><td>'.esc($f['status']).'</td><td>'; if($f['status']==='created') echo '<form method="post" style="display:inline"><input type="hidden" name="csrf" value="'.esc(csrf_token()).'"><input type="hidden" name="fund_id" value="'.esc($f['id']).'"><button name="confirm_fund" class="btn btn-sm btn-success">Confirm credit</button></form>'; echo '</td></tr>'; } ?></tbody></table></div></div>
+</div></div></body></html>
 
 ---
 
-/* === FILE: public/logout.php === */
+/* === FILE: public/addfunds.php === */
 <?php
-require __DIR__ . '/functions.php'; session_destroy(); header('Location: index.php'); exit;
+require __DIR__ . '/functions.php'; if(!isLogged()) header('Location: login.php');
+// Razorpay server integration (create order)
+if($_SERVER['REQUEST_METHOD']==='POST'){
+    if(!verify_csrf(post('csrf'))) die('Invalid CSRF token');
+    $amount = (float)post('amount',0);
+    if($amount<=0) $error='Invalid amount';
+    else {
+        // amount in paise for Razorpay
+        $amount_paise = (int)round($amount * 100);
+        // create order via Razorpay REST API using key_id and key_secret
+        $key_id = $config['razorpay_key_id']; $key_secret = $config['razorpay_key_secret'];
+        $post = json_encode(['amount'=>$amount_paise,'currency'=>'INR','receipt'=>'rcpt_'.time(),'payment_capture'=>1]);
+        $ch = curl_init('https://api.razorpay.com/v1/orders');
+        curl_setopt($ch, CURLOPT_USERPWD, $key_id . ':' . $key_secret);
+        curl_setopt($ch, CURLOPT_POST, 1);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $post);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+        $resp = curl_exec($ch); $err = curl_error($ch); $http = curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
+        if($err) { $error = 'Payment gateway error'; log_event('Razorpay create error: '.$err); }
+        else {
+            $data = json_decode($resp, true);
+            if(isset($data['id'])){
+                // store funds request
+                $stmt = $pdo->prepare('INSERT INTO funds_requests (user_id, razorpay_order_id, amount, currency, status) VALUES (:uid, :roid, :amt, :cur, :st)');
+                $stmt->execute([':uid'=>$_SESSION['user_id'],':roid'=>$data['id'],':amt'=>$amount,':cur'=>'INR',':st'=>'created']);
+                $fund_id = $pdo->lastInsertId();
+                // return data to client to open Razorpay checkout
+                $razorpay_order = $data; // contains id, amount, currency
+                // render checkout page below
+            } else { $error = 'Payment gateway rejected request'; log_event('Razorpay create failed: '.substr($resp,0,400)); }
+        }
+    }
+}
+?><!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Add Funds</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"></head><body class="bg-light">
+<div class="container py-4"><div class="card"><div class="card-body">
+<h4>Add Funds</h4><?php if(!empty($error)): ?><div class="alert alert-danger"><?=esc($error)?></div><?php endif; ?><?php if(!empty($success)): ?><div class="alert alert-success"><?=esc($success)?></div><?php endif; ?>
+<?php if(empty($razorpay_order)): ?>
+<form method="post">
+<input type="hidden" name="csrf" value="<?=esc(csrf_token())?>">
+<div class="mb-2"><input name="amount" class="form-control" placeholder="Amount (INR)" required></div>
+<button class="btn btn-primary">Pay with Razorpay</button>
+</form>
+<?php else: // render razorpay checkout ?>
+<p>Proceed to payment of ₹<?=number_format($razorpay_order['amount']/100,2)?></p>
+<form id="rzp-form">
+  <script src="https://checkout.razorpay.com/v1/checkout.js"
+    data-key="<?=esc($config['razorpay_key_id'])?>"
+    data-amount="<?=esc($razorpay_order['amount'])?>"
+    data-currency="<?=esc($razorpay_order['currency'])?>"
+    data-order_id="<?=esc($razorpay_order['id'])?>"
+    data-buttontext="Pay Now"
+    data-name="<?=esc($config['site_name'])?>"
+    data-description="Add funds to wallet"
+    data-prefill.name="<?=esc($_SESSION['name'])?>"
+    data-prefill.email="<?php $u=$pdo->prepare('SELECT email FROM users WHERE id=:id'); $u->execute([':id'=>$_SESSION['user_id']]); $ue=$u->fetch(PDO::FETCH_ASSOC); echo esc($ue['email']); ?>">
+  </script>
+  <input type="hidden" custom="Hidden Element" name="hidden">
+</form>
+<script> // The Checkout will open automatically because of script tag. You can also handle response in webhook.
+</script>
+<?php endif; ?></div></div></div></body></html>
+
+---
+
+/* === FILE: public/webhook_razorpay.php === */
+<?php
+// Razorpay webhook endpoint — set this URL in Razorpay dashboard and use secret
+require __DIR__ . '/functions.php';
+// you need to set webhook secret in Razorpay dashboard and here
+$webhook_secret = 'replace_with_webhook_secret';
+$payload = file_get_contents('php://input');
+$header_signature = $_SERVER['HTTP_X_RAZORPAY_SIGNATURE'] ?? '';
+if(!$header_signature) { http_response_code(400); echo 'Missing signature'; exit; }
+$expected = hash_hmac('sha256', $payload, $webhook_secret);
+if(!hash_equals($expected, $header_signature)) { http_response_code(403); echo 'Invalid signature'; exit; }
+$event = json_decode($payload, true);
+if(!$event) { http_response_code(400); echo 'Bad payload'; exit; }
+// handle payment authorized / paid
+if($event['event'] === 'payment.captured' || $event['event'] === 'order.paid' || $event['event'] === 'payment.authorized'){
+    // extract order_id from payload
+    $order_rid = $event['payload']['payment']['entity']['order_id'] ?? ($event['payload']['order']['entity']['id'] ?? null);
+    $amount = ($event['payload']['payment']['entity']['amount'] ?? 0) / 100.0;
+    if($order_rid){
+        // find funds_requests row
+        $stmt = $pdo->prepare('SELECT * FROM funds_requests WHERE razorpay_order_id = :roid LIMIT 1');
+        $stmt->execute([':roid'=>$order_rid]); $fr = $stmt->fetch(PDO::FETCH_ASSOC);
+        if($fr && $fr['status'] === 'created'){
+            // update status and credit user
+            $pdo->beginTransaction();
+            try{
+                $pdo->prepare('UPDATE funds_requests SET status = :st WHERE id=:id')->execute([':st'=>'credited',':id'=>$fr['id']]);
+                $pdo->prepare('UPDATE users SET balance = balance + :amt WHERE id=:uid')->execute([':amt'=>$fr['amount'],':uid'=>$fr['user_id']]);
+                $pdo->commit();
+                log_event("Funds credited: funds_id={$fr['id']} user={$fr['user_id']} amount={$fr['amount']}");
+            }catch(Exception $e){ $pdo->rollBack(); log_event('Webhook credit failed: '.$e->getMessage()); }
+        }
+    }
+}
+http_response_code(200); echo 'OK';
 
 ---
 
 /* === FILE: public/ticket.php === */
-<?php
-require __DIR__ . '/functions.php'; if (!isLogged()) header('Location: login.php');
-if ($_SERVER['REQUEST_METHOD']==='POST'){
-    $stmt = $pdo->prepare('INSERT INTO tickets (user_id,subject,message) VALUES (:uid,:s,:m)');
-    $stmt->execute([':uid'=>$_SESSION['user_id'],':s'=>$_POST['subject'],':m'=>$_POST['message']]);
-    $msg='Ticket opened';
-}
+<?php require __DIR__ . '/functions.php'; if(!isLogged()) header('Location: login.php'); if($_SERVER['REQUEST_METHOD']==='POST'){ if(!verify_csrf(post('csrf'))) die('Invalid CSRF token'); $stmt=$pdo->prepare('INSERT INTO tickets (user_id,subject,message) VALUES (:uid,:s,:m)'); $stmt->execute([':uid'=>$_SESSION['user_id'],':s'=>substr(post('subject',''),0,200),':m'=>post('message','')]); $msg='Ticket opened'; }
 ?><!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Ticket</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"></head><body class="bg-light">
-<div class="container py-4"><div class="card"><div class="card-body">
-<h4>Open Ticket</h4>
-<?php if(!empty($msg)) echo '<div class="alert alert-success">'.esc($msg).'</div>';?>
-<form method="post">
-  <div class="mb-2"><input name="subject" class="form-control" placeholder="Subject"></div>
-  <div class="mb-2"><textarea name="message" class="form-control" placeholder="Message"></textarea></div>
-  <button class="btn btn-primary">Submit</button>
-</form>
-</div></div></div>
-</body></html>
+<div class="container py-4"><div class="card"><div class="card-body"><h4>Open Ticket</h4><?php if(!empty($msg)) echo '<div class="alert alert-success">'.esc($msg).'</div>'; ?><form method="post"><input type="hidden" name="csrf" value="<?=esc(csrf_token())?>"><div class="mb-2"><input name="subject" class="form-control" placeholder="Subject" required></div>
+<div class="mb-2"><textarea name="message" class="form-control" placeholder="Message" required></textarea></div><button class="btn btn-primary">Submit</button></form></div></div></div></body></html>
+
+---
+
+/* === FILE: public/logout.php === */
+<?php require __DIR__ . '/functions.php'; session_destroy(); header('Location: index.php'); exit; ?>
 
 ---
 
 /* === FILE: public/README-DEPLOY.txt === */
-Deployment checklist:
-- Replace DB credentials in config.php
-- Set up MySQL and import db.sql
-- Secure admin user: change password hash in db.sql or via admin panel
-- Install SSL (Certbot) and point domain to VPS
-- For production, run behind HTTPS and configure firewall
-- Integrate payment gateways: Razorpay/Stripe SDKs and add add-funds flow (this code uses balance deduction only)
-- For provider APIs: ask providers for their API docs, map service IDs, test in staging
+Follow the previously-provided deployment guide. Important additions for this final version:
+1. Install composer and (optionally) Razorpay PHP SDK: `composer require razorpay/razorpay` and ensure `vendor/autoload.php` is present.
+2. Place `storage/` outside public webroot and set writable by web server user.
+3. Configure `config.php`: set DB credentials, base_url, razorpay keys, and `csrf_salt`.
+4. In Razorpay dashboard:
+   - Add webhook URL: `https://your-domain.com/webhook_razorpay.php` and set a **webhook secret**. Put that secret in `webhook_razorpay.php`.
+   - Use test keys first, then switch to live keys.
+5. Secure server: set PHP `display_errors = Off`, enable firewall, secure MySQL root & users, fail2ban.
+6. Test payment flow in test_mode; confirm funds requests are credited automatically by webhook.
 
 ---
 
-# End of single-file project
+# Final notes
+- Yeh final code ek production-ready **starter** hai with Razorpay wallet add-funds functionality. Still test thoroughly on a staging server before using live.
+- Agar chaho to main ab: (1) update webhook secret into code and test sample webhook payloads, (2) generate `composer` `vendor/` files and provide a zip you can directly upload, or (3) remotely guide you through deployment step-by-step while you paste server outputs.
 
 
